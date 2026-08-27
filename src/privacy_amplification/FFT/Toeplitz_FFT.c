@@ -180,7 +180,17 @@ void reverse_array(float complex *X, int N, int s){
 // of the butterfly (dropping it again once stage 2 begins). Callers pass 0
 // for every FFT call that should NOT be visible in a power trace (the seed's
 // FFT, and the FFT performed internally by DIT_IFFT).
-void DIT_FFT(float complex *X, int N, int trigger){
+//
+// `stop_after_stage1`: when nonzero, returns as soon as stage 1 finishes
+// instead of computing the remaining log2(N)-1 stages. Only stage 1 is ever
+// triggered/captured, so for KEY_FFT_ONLY's trace-gathering build (see
+// Toeplitz_hash_fft_key_only) every later stage is pure wasted soft-float
+// compute time between traces -- worse, it delays the target getting back
+// to read_bytes() for the *next* key long enough that a host write can land
+// before the target is listening again, desyncing the UART (single holding
+// register, no FIFO). Callers that need a correct FFT result (the full
+// hash's key/seed FFTs, and DIT_IFFT) must pass 0 here.
+void DIT_FFT(float complex *X, int N, int trigger, int stop_after_stage1){
 
     //int collected = 0;
 
@@ -224,7 +234,6 @@ void DIT_FFT(float complex *X, int N, int trigger){
             X[p] = y+z;
             X[q] = y-z;
 
-
             p++;
             q++;
             n++;
@@ -234,12 +243,21 @@ void DIT_FFT(float complex *X, int N, int trigger){
                 n=0;
             }
         }
+        if (stage == 1 && stop_after_stage1){
+            // trigger_low() above only fires on stage 2's first iteration,
+            // which we're about to skip -- drop the trigger explicitly so
+            // it doesn't stay high indefinitely.
+            if (trigger){
+              trigger_low();
+            }
+            break;
+        }
     }
 }
 
 void DIT_IFFT(float complex *X, int N){
     conj_array(X, N);
-    DIT_FFT(X,N,0);
+    DIT_FFT(X,N,0,0);
     conj_array(X,N);
 
     for(int i = 0; i < N; i++){
@@ -263,7 +281,10 @@ void Toeplitz_hash_fft_key_only(int *input_key, int N){
       key_fft[i] = input_key[i] + 0*I;
     }
 
-    DIT_FFT(key_fft, N, 1);   // triggered: key NTT
+    DIT_FFT(key_fft, N, 1, 1);   // triggered: key NTT, stop right after stage 1 -- the
+                                  // rest is never captured and nothing reads key_fft
+                                  // again in this build, so computing it would be pure
+                                  // wasted time before the target's back in read_bytes().
 }
 
 #else
@@ -291,8 +312,8 @@ void Toeplitz_hash_fft_seeded(int *input_key, int *seed, int *output_key, int N)
       seed_fft[i] = seed[i] + 0*I;
     }
 
-    DIT_FFT(key_fft, N, 1);   // triggered: key NTT
-    DIT_FFT(seed_fft, N, 0);  // untriggered: seed NTT
+    DIT_FFT(key_fft, N, 1, 0);   // triggered: key NTT
+    DIT_FFT(seed_fft, N, 0, 0);  // untriggered: seed NTT
 
     for(int i = 0; i < N; i++){
       key_fft[i] = key_fft[i] * seed_fft[i];
