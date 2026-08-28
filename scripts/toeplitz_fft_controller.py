@@ -67,10 +67,10 @@ import numpy as np
 import chipwhisperer as cw
 from chipwhisperer.capture.api.programmers import SAM4SProgrammer
 
-ROWLEN = 1  # bytes; must match the firmware's build-time ROWLEN
+ROWLEN = 16  # bytes; must match the firmware's build-time ROWLEN
 KEY_FFT_ONLY = False  # must match the firmware's build-time KEY_FFT_ONLY
 
-hex_dir = "/home/40265864@ecit.qub.ac.uk/CSIT/Toeplitz_attack_CW312/src/privacy_amplification/FFT/"
+hex_dir = "/home/40265864@ecit.qub.ac.uk/CSIT/Toeplitz_Attack_CW312/src/privacy_amplification/FFT/"
 
 
 class CommsError(Exception):
