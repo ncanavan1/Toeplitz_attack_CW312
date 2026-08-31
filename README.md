@@ -20,10 +20,11 @@ scripts/
   tools.py                     capture / segmentation / template / attack-scoring library (class Tools)
   template_attack.py           the attack driver — CLI with `profile` and `attack` subcommands
 src/privacy_amplification/FFT/
-  Toeplitz_FFT.c               the firmware (one source, two build modes)
-  makefile                     builds Toeplitz_FFT-ROWLEN<n>-{FULL,KEYONLY}-CW312_SAM4S.hex
+  Toeplitz_FFT.c               the firmware
+  makefile                     builds Toeplitz_FFT-ROWLEN<n>-CW312_SAM4S.hex
   gen_twiddle_table.py         regenerates twiddle_table.h for a given ROWLEN (run by the makefile)
 results/                       captured traces, templates, plots (git-ignored)
+docs/                          committed figures embedded in this README
 ```
 
 ## Requirements
@@ -37,92 +38,122 @@ results/                       captured traces, templates, plots (git-ignored)
 
 ## 1. Build & flash the firmware
 
-The C source builds into **two** executables, selected by `KEY_FFT_ONLY`:
+There is **one** firmware build. It computes the full seeded hash
+(key FFT → seed FFT → pointwise multiply → IFFT → mod 2) so its result can
+be checked, and only **stage 1 of the key FFT** is wrapped by the CW
+trigger, so the same binary is what power traces are captured from.
 
-| Build | `make` flags | Protocol | Used for |
-|-------|--------------|----------|----------|
-| **FULL**    | `KEY_FFT_ONLY=0` (default) | key → echo → seed → echo → result | correctness verification |
-| **KEYONLY** | `KEY_FFT_ONLY=1` | key → echo (triggered key FFT only) | trace gathering / the attack |
+Per iteration the device speaks a raw binary protocol over the CW UART.
+Each exchange is a one-byte command followed by its payload:
 
-`ROWLEN` is the key size **in bytes** and must match on both sides. The
-makefile defaults to `ROWLEN=128`; the Python side defaults to
-`ROWLEN=16` — pass `--rowlen` to the scripts, or `ROWLEN=` to `make`, so
-they agree.
+```
+host -> 'k' + key      target -> key echo
+host -> 's' + seed     target -> seed echo
+host -> 'g'            target -> result   (hash of the loaded key + seed)
+```
+
+Splitting the load and run steps lets a capture be armed after both slow
+transfers and before the one-byte `'g'`, so the trigger fires right after
+`scope.arm()`.
+
+`ROWLEN` is the key/seed size **in bytes**; `ROWLEN*8` must be a power of
+two. It must match on both sides — the makefile and the Python scripts
+both default to **64** (a 512-bit hash); override with `ROWLEN=` to `make`
+and `--rowlen` to the scripts together.
 
 ```bash
 cd src/privacy_amplification/FFT
-
-# Attack / trace-gathering firmware (KEYONLY), 16-byte key:
-make clean && make ROWLEN=16 KEY_FFT_ONLY=1
-
-# Correctness firmware (FULL), same key size:
-make clean && make ROWLEN=16 KEY_FFT_ONLY=0
+make clean && make               # -> Toeplitz_FFT-ROWLEN64-CW312_SAM4S.hex
+make clean && make ROWLEN=128     # -> Toeplitz_FFT-ROWLEN128-CW312_SAM4S.hex
 ```
 
-> `make clean` between builds is required — the object dir is keyed only on
-> `PLATFORM`, so a stale rebuild would silently keep objects from the
-> previous `ROWLEN` / `KEY_FFT_ONLY`.
+> `make clean` before a rebuild with a different `ROWLEN` is required — the
+> object dir is keyed only on `PLATFORM`, so a stale rebuild would silently
+> keep objects from the previous `ROWLEN`.
 
 The Python code flashes the matching `.hex` for you (see
-`toeplitz_fft_controller.connect()`), so you normally only need to *build*
-it, not flash it by hand.
+`toeplitz_fft_controller.connect()` / `hex_path()`), so you normally only
+need to *build* it, not flash it by hand.
 
 ## 2. (Optional) Verify the firmware is correct
 
-Flash the **FULL** build, then check the device against the numpy
-reference implementation:
-
 ```bash
-python scripts/toeplitz_fft_controller.py --rowlen 16 --trials 100
+python scripts/toeplitz_fft_controller.py --rowlen 64 --trials 10
 ```
 
-Exit status is 0 iff every trial matched with no unresolved UART desyncs.
-`--raw SECONDS` (optionally with `--key-only` for the KEYONLY build) dumps
-the raw bytes the device sends instead of verifying — useful when
-debugging comms.
+Runs random key/seed pairs through the device and checks each result
+against the numpy reference (`reference_hash`). Exit status is 0 iff every
+trial matched with no unresolved UART desyncs. 
 
 ---
 
 ## 3. Profile — build the templates
 
-Flash the **KEYONLY** build first. Profiling has two modes:
-
 ```bash
 # (a) Capture fresh raw traces from the ChipWhisperer, then build templates:
-python scripts/template_attack.py profile --online
+python scripts/template_attack.py --rowlen 16 profile --online
 
 # (b) Rebuild templates from a previously captured raw-trace .npz — no hardware:
-python scripts/template_attack.py profile
+python scripts/template_attack.py --rowlen 16 profile
 ```
 
 Options: `--repeats N` (traces averaged per class, default 3). `--rowlen`
-and `--results-dir` are global — put them *before* the subcommand
-(`template_attack.py --rowlen 16 profile`).
+and `--results-dir` are global — put them *before* the subcommand.
 
-Writes to `results/` (for `--rowlen 16`):
+Writes to `results/` (names shown for `--rowlen 16`):
 
 | File | Written by | Contents |
 |------|-----------|----------|
 | `raw_traces_rowlen16.npz` / `.png` | `--online` only | every pre-segmentation capture (warmup + 4 classes × repeats) |
+| `warmup_telescope_rowlen16.png` | `--online` only | 3-level telescopic view of the warmup (also copied to `docs/warmup_telescope.png`) |
 | `templates_rowlen16.npz` / `.png` | always | the 4 per-butterfly mean templates `(4, n_seg, seg_len)` + metadata |
 | `aligment_trace.npy` | always | the alignment reference window every later capture is segmented against |
 
 Splitting capture (`--online`) from template-building lets you iterate on
 segmentation / averaging offline against a fixed raw-trace set.
 
+## Trace anatomy — telescopic view of the warmup
+
+Every `profile --online` run (`save_raw_traces(..., plot=True)`) also writes
+a three-panel telescopic view of the warmup capture,
+`docs/warmup_telescope.png` — each panel expands the shaded slice of the one
+above it:
+
+![Warmup telescope](docs/warmup_telescope.png)
+
+- **Top — the whole trigger window.** One `'g'` runs the full hash, but the
+  CW trigger is held high only for **stage 1 of the key FFT**: `N/2` radix-2
+  butterflies (255 landmarks at `ROWLEN=64`, `N=512`) back-to-back in a
+  single ~128 k-sample trace.
+- **Middle — 16 consecutive butterfly segments.** The periodicity resolves
+  into one repeating unit per butterfly. Dotted lines are the landmarks
+  `
+- **Bottom — one butterfly unit.** This 400-sample window (`window_below=300`
+  before the landmark, `window_above=100` after) is exactly one segment the
+  segmenter emits, one row of a template, and one window
+  `run_profiled_attack()` scores by SAD. The red band is the alignment
+  window itself. The aligment window is a common section of power trace that follows all but the last butterfly operations. When viewing the templates it is the overlapping section that corresponds to this allignment window.
+
+**Segmentation** The `sliding_window_segmenter()` finds: it slides a         70-sample reference
+  (`allign_p0:allign_p1`, lifted from the first butterfly) across the whole
+  trace and marks every position where the SAD falls below `sad_thresh`.
+  One landmark per butterfly ⇒ `N/2 − 1` segments (the last runs off the end meaning we do not actually attack the last 2 butterfly bits).
+
+![Templates](docs/templates_rowlen64.png)
+
+**Butterfly Templates** Each of the `N/2 -1` segments has 4 templates at the end of the profiling phase. There is slight permutation between the power traces of different butterfly operations so a segment wise templating strategy is more robust than 4 generic templates. The begining of the templates is data dependant, while the later portion is not and is constant. We use this as the alignment region between templates and trace segments.
+
 ## 4. Attack — recover keys
 
-Flash the **KEYONLY** build. Loads the saved templates + alignment
-reference (no re-profiling), then for each random key: captures a target
-trace, segments it, and scores every butterfly against the 4 templates by
-**SAD** (lowest wins → that butterfly's two key bits).
-
 ```bash
-python scripts/template_attack.py attack --tests 20
+python scripts/template_attack.py --rowlen 16 attack --tests 20
 ```
 
-Prints `Correct key bits: c/N` per test; **exit status is 0 iff every
-test recovered the full key**.
+Loads the saved templates + alignment reference (no re-profiling), then
+for each random key: captures a target trace, segments it, and scores
+every butterfly against the 4 templates by **SAD** (lowest wins → that
+butterfly's two key bits). Prints `Correct key bits: c/N` per test;
+**exit status is 0 iff every test recovered the full key**.
 
 Both functions are importable for notebook / REPL use:
 
@@ -149,7 +180,7 @@ ok = ta.attack(rowlen=16, tests=10)       # -> bool
   (`CLKGEN Failed to load divider value` spam). `configure_scope()` calls
   `scope.clock.reset_adc()`; `Tools.reset_target()` recovers the target
   side.
-- **RAM ceiling** — a larger `ROWLEN` needs more target RAM. See the
-  header docstring of `toeplitz_fft_controller.py` for the tested limits
-  (KEYONLY tolerates roughly double the FULL build).
-```
+- **RAM ceiling** — a larger `ROWLEN` needs more target RAM. The default
+  is 64 bytes; see the header docstring of `toeplitz_fft_controller.py`
+  for the tested limits (128 bytes comfortable, 256 tight, 512+ fails to
+  link).

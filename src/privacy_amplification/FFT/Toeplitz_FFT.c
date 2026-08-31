@@ -6,9 +6,17 @@
 #include <complex.h>
 #include <time.h>
 
-#define IDLE 0
-#define KEY 1
-#define PLAIN 2
+// Single-byte protocol commands (see toeplitz_fft_controller.py). Key and
+// seed are loaded by their own commands and kept in memory; CMD_GO then
+// runs the hash on whatever is currently loaded. This lets the host
+// finish every slow UART transfer *before* it arms the capture and send
+// only CMD_GO afterwards, so the trigger fires within microseconds of the
+// arm instead of after a full key+seed+echo exchange (a delay long enough
+// to break scope.adc.stream_mode captures -- "no trigger seen").
+#define CMD_LOAD_KEY  'k'
+#define CMD_LOAD_SEED 's'
+#define CMD_GO        'g'
+
 #define PI 3.1415926535897932384626433832795  // Value of Pi
 #define BUFLEN 64
 
@@ -18,12 +26,12 @@
 // into 8 individual bits before hashing -- ROWBITS is that bit-vector
 // length, and it's what actually needs to be a power of two for the
 // radix-2 DIT FFT.
-// 128 bytes (1024 bits) is a tested, comfortable ceiling for this SAM4S
-// target's 64KB of RAM (~51% used); 256 bytes builds but leaves under 5%
-// headroom, and 512+ fails to link outright -- see the RAM comment on
-// Toeplitz_hash_fft_seeded.
+// The default is 64 bytes (512-bit hash). 128 bytes (1024 bits) is a
+// tested, comfortable ceiling for this SAM4S target's 64KB of RAM (~51%
+// used); 256 bytes builds but leaves under 5% headroom, and 512+ fails to
+// link outright -- see the RAM comment on Toeplitz_hash_fft_seeded.
 #ifndef ROWLEN
-#define ROWLEN 128
+#define ROWLEN 64
 #endif
 
 #define ROWBITS (ROWLEN * 8)
@@ -32,21 +40,11 @@
 #error "ROWLEN*8 must be a power of two (required by the radix-2 DIT FFT)"
 #endif
 
-// Build two different executables from this one source file:
-//   KEY_FFT_ONLY=0 (default): the full Toeplitz hash (key FFT, seed FFT,
-//     pointwise multiply, IFFT, mod2) -- what's needed for a real,
-//     correct privacy-amplification key.
-//   KEY_FFT_ONLY=1: only reads a key, echoes it, and runs the triggered
-//     key FFT -- nothing else. For SCA trace gathering, the triggered key
-//     FFT is the only part that's ever actually captured (see the
-//     `trigger` comment on DIT_FFT); the seed FFT/IFFT/mod2 stages just
-//     burn UART and compute time between traces without ever appearing in
-//     a trace. Dropping them (and the seed's RAM entirely -- no seed_fft,
-//     no seed/output byte or bit arrays) shortens the per-trace round
-//     trip, so more traces can be collected per unit wall-clock time.
-#ifndef KEY_FFT_ONLY
-#define KEY_FFT_ONLY 0
-#endif
+// One build serves both purposes: the full Toeplitz hash (key FFT, seed
+// FFT, pointwise multiply, IFFT, mod2) produces a real, correct
+// privacy-amplification key for verification, and only stage 1 of the
+// key FFT is triggered, so the same firmware is what SCA traces are
+// captured from (see the `trigger` comment on DIT_FFT).
 
 uint8_t memory[BUFLEN];
 uint8_t tmp[BUFLEN];
@@ -179,18 +177,10 @@ void reverse_array(float complex *X, int N, int s){
 // `trigger`: when nonzero, raises the CW trigger for the duration of stage 1
 // of the butterfly (dropping it again once stage 2 begins). Callers pass 0
 // for every FFT call that should NOT be visible in a power trace (the seed's
-// FFT, and the FFT performed internally by DIT_IFFT).
-//
-// `stop_after_stage1`: when nonzero, returns as soon as stage 1 finishes
-// instead of computing the remaining log2(N)-1 stages. Only stage 1 is ever
-// triggered/captured, so for KEY_FFT_ONLY's trace-gathering build (see
-// Toeplitz_hash_fft_key_only) every later stage is pure wasted soft-float
-// compute time between traces -- worse, it delays the target getting back
-// to read_bytes() for the *next* key long enough that a host write can land
-// before the target is listening again, desyncing the UART (single holding
-// register, no FIFO). Callers that need a correct FFT result (the full
-// hash's key/seed FFTs, and DIT_IFFT) must pass 0 here.
-void DIT_FFT(float complex *X, int N, int trigger, int stop_after_stage1){
+// FFT, and the FFT performed internally by DIT_IFFT). Only stage 1 of the
+// key FFT is ever captured; the remaining log2(N)-1 stages still run -- they
+// are needed for a correct hash result -- but never appear in a trace.
+void DIT_FFT(float complex *X, int N, int trigger){
 
     //int collected = 0;
 
@@ -243,21 +233,12 @@ void DIT_FFT(float complex *X, int N, int trigger, int stop_after_stage1){
                 n=0;
             }
         }
-        if (stage == 1 && stop_after_stage1){
-            // trigger_low() above only fires on stage 2's first iteration,
-            // which we're about to skip -- drop the trigger explicitly so
-            // it doesn't stay high indefinitely.
-            if (trigger){
-              trigger_low();
-            }
-            break;
-        }
     }
 }
 
 void DIT_IFFT(float complex *X, int N){
     conj_array(X, N);
-    DIT_FFT(X,N,0,0);
+    DIT_FFT(X,N,0);
     conj_array(X,N);
 
     for(int i = 0; i < N; i++){
@@ -267,34 +248,13 @@ void DIT_IFFT(float complex *X, int N){
 
 
 
-#if KEY_FFT_ONLY
-
-// Trace-gathering build: only the triggered key FFT, nothing else -- see
-// the KEY_FFT_ONLY comment above.
-void Toeplitz_hash_fft_key_only(int *input_key, int N){
-    // static: see the RAM comment on Toeplitz_hash_fft_seeded (the full
-    // build's equivalent). Only one ROWBITS-sized complex array here,
-    // since there's no seed to hold.
-    static float complex key_fft[ROWBITS];
-
-    for(int i = 0; i < N; i++){
-      key_fft[i] = input_key[i] + 0*I;
-    }
-
-    DIT_FFT(key_fft, N, 1, 1);   // triggered: key NTT, stop right after stage 1 -- the
-                                  // rest is never captured and nothing reads key_fft
-                                  // again in this build, so computing it would be pure
-                                  // wasted time before the target's back in read_bytes().
-}
-
-#else
-
 // Seeded variant: instead of deriving the circulant from a Toeplitz row/col
 // spec, a random seed of the same length as the key is FFT'd and pointwise
 // multiplied with the key's FFT (circular convolution of key and seed),
 // then IFFT'd and reduced mod 2. Only the key's FFT is triggered so power
 // traces capture leakage from the key-dependent NTT butterfly and nothing
-// else.
+// else -- this one build serves both SCA trace gathering and correctness
+// verification.
 void Toeplitz_hash_fft_seeded(int *input_key, int *seed, int *output_key, int N){
     // Fixed-size, not malloc'd: ROWBITS is a compile-time constant and N is
     // always ROWBITS in this firmware, so there's no need for heap
@@ -312,8 +272,8 @@ void Toeplitz_hash_fft_seeded(int *input_key, int *seed, int *output_key, int N)
       seed_fft[i] = seed[i] + 0*I;
     }
 
-    DIT_FFT(key_fft, N, 1, 0);   // triggered: key NTT
-    DIT_FFT(seed_fft, N, 0, 0);  // untriggered: seed NTT
+    DIT_FFT(key_fft, N, 1);   // triggered: key NTT (only stage 1 is captured)
+    DIT_FFT(seed_fft, N, 0);  // untriggered: seed NTT
 
     for(int i = 0; i < N; i++){
       key_fft[i] = key_fft[i] * seed_fft[i];
@@ -327,8 +287,6 @@ void Toeplitz_hash_fft_seeded(int *input_key, int *seed, int *output_key, int N)
     }
 }
 
-#endif
-
 //////////////////////////
 /// END FFT STUFF ////////
 
@@ -341,44 +299,49 @@ int main(void)
     // static: see the comment on key_fft/seed_fft in
     // Toeplitz_hash_fft_seeded -- these don't fit on the stack at large
     // ROWLEN, and are fully overwritten each iteration regardless.
+    // input_key_bits/seed_bits are zero-initialised (static), so a CMD_GO
+    // issued before anything is loaded hashes all-zero inputs rather than
+    // reading uninitialised memory.
     static uint8_t input_key_bytes[ROWLEN];
     static int input_key_bits[ROWBITS];
-#if KEY_FFT_ONLY
-
-    while(1){
-      read_bytes(input_key_bytes, ROWLEN);
-      write_bytes(input_key_bytes, ROWLEN);  // echo, so the host can detect a UART desync
-      bytes_to_bits(input_key_bytes, input_key_bits, ROWLEN);
-
-      Toeplitz_hash_fft_key_only(input_key_bits, ROWBITS);
-      }
-      return 1;
-  }
-
-#else
-
     static uint8_t seed_bytes[ROWLEN];
     static uint8_t output_bytes[ROWLEN];
     static int seed_bits[ROWBITS];
     static int output_bits[ROWBITS];
 
     while(1){
-      read_bytes(input_key_bytes, ROWLEN);
-      write_bytes(input_key_bytes, ROWLEN);  // echo, so the host can detect a UART desync
-      bytes_to_bits(input_key_bytes, input_key_bits, ROWLEN);
+      int cmd = getch();
+      switch(cmd){
 
-      read_bytes(seed_bytes, ROWLEN);
-      write_bytes(seed_bytes, ROWLEN);  // echo
-      bytes_to_bits(seed_bytes, seed_bits, ROWLEN);
+        case CMD_LOAD_KEY:
+          read_bytes(input_key_bytes, ROWLEN);
+          write_bytes(input_key_bytes, ROWLEN);  // echo, so the host can detect a UART desync
+          bytes_to_bits(input_key_bytes, input_key_bits, ROWLEN);
+          break;
 
-      Toeplitz_hash_fft_seeded(input_key_bits, seed_bits, output_bits, ROWBITS);
+        case CMD_LOAD_SEED:
+          read_bytes(seed_bytes, ROWLEN);
+          write_bytes(seed_bytes, ROWLEN);  // echo
+          bytes_to_bits(seed_bytes, seed_bits, ROWLEN);
+          break;
 
-      bits_to_bytes(output_bits, output_bytes, ROWLEN);
-      write_bytes(output_bytes, ROWLEN);  // result
+        case CMD_GO:
+          // Nothing slow between here and trigger_high() (raised inside
+          // DIT_FFT): just the getch() that already returned plus the
+          // float-complex load and bit-reversal. Arm the capture, send
+          // this one byte, and the trigger follows immediately.
+          Toeplitz_hash_fft_seeded(input_key_bits, seed_bits, output_bits, ROWBITS);
+          bits_to_bytes(output_bits, output_bytes, ROWLEN);
+          write_bytes(output_bytes, ROWLEN);  // result
+          break;
+
+        default:
+          // Unknown byte (startup noise, a desync): ignore it rather than
+          // consuming ROWLEN bytes behind it and shifting the protocol.
+          break;
       }
-      return 1;
+    }
+    return 1;
   }
-
-#endif
 
 

@@ -1,5 +1,5 @@
-"""Driver for the profiled SAD template attack against the KEY_FFT_ONLY
-Toeplitz/FFT firmware on a CW312 target (algorithms live in tools.py).
+"""Driver for the profiled SAD template attack against the Toeplitz/FFT
+firmware on a CW312 target (algorithms live in tools.py).
 
 Two phases, exposed as subcommands:
 
@@ -32,9 +32,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import toeplitz_fft_controller as tfc
 import tools
 
-# Key/seed size in BYTES -- must match the KEY_FFT_ONLY=1 firmware's
-# build-time ROWLEN (see toeplitz_fft_controller.py / Toeplitz_FFT.c).
-DEFAULT_ROWLEN = 16
+# Key/seed size in BYTES -- must match the firmware's build-time ROWLEN
+# (see toeplitz_fft_controller.py / Toeplitz_FFT.c).
+DEFAULT_ROWLEN = 64
 DEFAULT_RESULTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
 
@@ -62,9 +62,9 @@ def profile(rowlen=DEFAULT_ROWLEN, repeats=3, online=False,
     raw_path, templates_path, align_path = _paths(results_dir, rowlen)
 
     if online:
-        scope, target = tfc.connect(rowlen=rowlen, key_fft_only=True)
+        scope, target = tfc.connect(rowlen=rowlen)
         t = tools.Tools(scope, target, rowlen=rowlen)
-        t.configure_scope()
+        t.configure_scope(ROWLEN=rowlen)
         t.save_raw_traces(N, repeats, path=raw_path)
     else:
         t = tools.Tools(None, None, rowlen=rowlen)
@@ -95,9 +95,9 @@ def attack(rowlen=DEFAULT_ROWLEN, tests=10, results_dir=DEFAULT_RESULTS_DIR):
     N = rowlen * 8
     _, templates_path, align_path = _paths(results_dir, rowlen)
 
-    scope, target = tfc.connect(rowlen=rowlen, key_fft_only=True)
+    scope, target = tfc.connect(rowlen=rowlen)
     t = tools.Tools(scope, target, rowlen=rowlen)
-    t.configure_scope()
+    t.configure_scope(ROWLEN=rowlen)
 
     tmpl = t.load_templates(templates_path)
     templates = tmpl["templates"]          # (4, n_seg, seg_len)
@@ -117,7 +117,7 @@ def attack(rowlen=DEFAULT_ROWLEN, tests=10, results_dir=DEFAULT_RESULTS_DIR):
     return all_ok
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rowlen", type=int, default=DEFAULT_ROWLEN,
@@ -137,7 +137,7 @@ def main():
     p_atk.add_argument("--tests", type=int, default=10,
                        help="number of random keys to recover")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.phase == "profile":
         profile(rowlen=args.rowlen, repeats=args.repeats, online=args.online,
@@ -151,3 +151,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    #For debugging without CLI flags, comment the line above and hardcode:
+    #main(["--rowlen", "128", "profile", "--repeats", "3", "--online"])

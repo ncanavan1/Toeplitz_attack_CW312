@@ -46,22 +46,16 @@ PLATFORM ?= CW312_SAM4S
 CRYPTO_TARGET ?= NONE
 
 # Key/seed size in bytes (ROWLEN*8 must be a power of two, checked at
-# compile time in Toeplitz_FFT.c). Override on the command line, e.g.
-# `make ROWLEN=256`.
+# compile time in Toeplitz_FFT.c). Default 64 bytes (512-bit hash);
+# override on the command line, e.g. `make ROWLEN=128`.
 #
-# KEY_FFT_ONLY selects which of the two executables described in
-# Toeplitz_FFT.c gets built: 0 (default) is the full Toeplitz hash; 1
-# drops everything but the triggered key FFT, for faster SCA trace
-# gathering (`make KEY_FFT_ONLY=1`).
-#
-# Changing either of these requires a rebuild - do `make clean` first
-# when switching, since object files built for a different ROWLEN or
-# KEY_FFT_ONLY won't be recompiled by make alone (OBJDIR is keyed only on
-# PLATFORM, not on these), and a stale rebuild would silently keep the
-# *old* binary's behavior despite the new filename.
-ROWLEN ?= 128
-KEY_FFT_ONLY ?= 0
-CDEFS += -DROWLEN=$(ROWLEN) -DKEY_FFT_ONLY=$(KEY_FFT_ONLY)
+# Changing ROWLEN requires a rebuild - do `make clean` first when
+# switching, since object files built for a different ROWLEN won't be
+# recompiled by make alone (OBJDIR is keyed only on PLATFORM, not on
+# ROWLEN), and a stale rebuild would silently keep the *old* binary's
+# FFT length despite the new filename.
+ROWLEN ?= 64
+CDEFS += -DROWLEN=$(ROWLEN)
 
 # twiddle_table.h holds DIT_FFT's precomputed twiddle factors as compile-
 # time float literals (see gen_twiddle_table.py -- C has no constexpr, so
@@ -73,10 +67,9 @@ CDEFS += -DROWLEN=$(ROWLEN) -DKEY_FFT_ONLY=$(KEY_FFT_ONLY)
 # ordering to get wrong.
 $(shell python3 gen_twiddle_table.py $(ROWLEN) > twiddle_table.h)
 
-# Target file name (without extension). Includes ROWLEN and the
-# KEY_FFT_ONLY mode so builds for different key sizes or modes don't
-# overwrite each other's output files.
-TARGET = Toeplitz_FFT-ROWLEN$(ROWLEN)-$(if $(filter 1,$(KEY_FFT_ONLY)),KEYONLY,FULL)
+# Target file name (without extension). Includes ROWLEN so builds for
+# different key sizes don't overwrite each other's output files.
+TARGET = Toeplitz_FFT-ROWLEN$(ROWLEN)
 
 #Add simpleserial project to build
 include ../simpleserial/Makefile.simpleserial

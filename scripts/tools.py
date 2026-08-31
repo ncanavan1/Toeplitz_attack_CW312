@@ -1,11 +1,14 @@
 """Tools and algorithms for the profiled SAD template attack against the
-KEY_FFT_ONLY Toeplitz/FFT firmware (see template_attack.py for the driver).
+Toeplitz/FFT firmware (see template_attack.py for the driver).
 
 Pipeline:
   save_raw_traces()      capture every pre-segmentation trace once, to a .npz
   load_raw_traces()      read that .npz back for offline development
   get_trace_from_raw()   -> sliding_window_segmenter(): cut a flat capture
                             into one aligned window per stage-1 butterfly
+  plot_warmup_telescope() 3-level zoom of the warmup capture (whole window
+                          -> 16 butterflies -> one butterfly + align window),
+                          written once per save_raw_traces()
   save_templates() /
   load_templates()       persist / reload the 4 averaged per-butterfly
                          templates (one per input bit-pair 00/01/10/11)
@@ -13,6 +16,7 @@ Pipeline:
                          recovering the key two bits per butterfly by SAD
 """
 import os
+import shutil
 import time
 
 import numpy as np
@@ -43,7 +47,7 @@ class Tools:
     ### SCOPE / TARGET #######
     ##########################
 
-    def configure_scope(self, samples=2000, offset=0, gain=25, adc_mul=1):
+    def configure_scope(self, samples=2000, offset=0, gain=25, adc_mul=1, ROWLEN=64):
         """Size the capture window and ADC gain for this attack. Call once
         after toeplitz_fft_controller.connect() (which only runs
         scope.default_setup()) and before the first _capture_raw().
@@ -67,16 +71,20 @@ class Tools:
         These defaults are starting points, not measured values -- tune
         them against a real captured trace/trig_count before relying on them.
         """
-        self.scope.adc.samples = samples * adc_mul * 16
+        self.scope.adc.stream_mode = False
+        self.scope.adc.samples = samples * adc_mul * ROWLEN
         self.scope.adc.offset = offset
         self.scope.gain.db = gain
         self.scope.clock.adc_mul = adc_mul
+        self.scope.adc.timeout = 10
         # Changing adc_mul can drop the target's clock momentarily (Husky
         # logs "Target clock may drop; you may need to reset your target")
         # and leave the ADC's PLL unlocked, which then shows up as repeated
         # "CLKGEN Failed to load divider value" errors on the next capture.
         # reset_target() recovers the target side; this recovers the scope side.
         self.scope.clock.reset_adc()
+        self.reset_target()
+    
 
     def reset_target(self):
         """Pulse nRST low then high to force the target firmware back to a
@@ -86,19 +94,39 @@ class Tools:
         self.scope.io.nrst = True
         time.sleep(0.001)
 
-    def _capture_raw(self, key_bits):
-        """Arm the scope, send `key_bits` (a length rowlen*8 bit array,
-        MSB-first per byte) to the KEY_FFT_ONLY firmware and return the raw
-        power capture: all N/2 stage-1 butterflies back-to-back under one
-        trigger, before sliding_window_segmenter() cuts it up.
-        save_raw_traces() dumps exactly this so the rest of the pipeline
-        can run offline (see get_trace_from_raw()).
+    def _capture_raw(self, key_bits, seed_bytes=None):
+        """Load `key_bits` (a length rowlen*8 bit array, MSB-first per
+        byte) plus a throwaway seed into the firmware, arm the scope, fire
+        the hash, and return the raw power capture: all N/2 stage-1
+        butterflies of the key FFT back-to-back under one trigger, before
+        sliding_window_segmenter() cuts it up. Only the key FFT is
+        triggered, so the seed value doesn't affect the trace -- it
+        defaults to all-zero. save_raw_traces() dumps exactly this so the
+        rest of the pipeline can run offline (see get_trace_from_raw()).
         """
         key_bytes = np.packbits(np.asarray(key_bits, dtype=np.uint8)).tolist()
+        if seed_bytes is None:
+            #seed_bytes = [1] * self.rowlen
+            seed_bytes = np.random.randint(0,256,self.rowlen).tolist()
+        # Load key + seed *before* arming: these are slow (a command byte,
+        # rowlen payload bytes and a rowlen echo each, at ~38400 baud with
+        # settling sleeps). Only the one-byte CMD_GO in trigger_hash() runs
+        # after arm(), so the trigger fires within microseconds of it --
+        # required for scope.adc.stream_mode, which streams from arm and
+        # would run out its sample budget during a full key/seed exchange
+        # ("no trigger seen").
+        reference_result = tfc.reference_hash(key_bytes, seed_bytes)
+
+        reader = tfc.ByteReader(self.target)
+        tfc.load_key(self.target, key_bytes, reader, rowlen=self.rowlen)
+        tfc.load_seed(self.target, list(seed_bytes), reader, rowlen=self.rowlen)
         self.scope.arm()
-        tfc.send_key_only(self.target, key_bytes, rowlen=self.rowlen)
+        result = tfc.trigger_hash(self.target, reader, rowlen=self.rowlen)
         if self.scope.capture():
-            raise RuntimeError("Capture failed")
+            if reference_result != result:
+                raise RuntimeError("Capture failed, Incorrect Result")
+            else:
+                raise RuntimeError("Capture failed, Correct Result...CW Issue most likely")
         trace = self.scope.get_last_trace()
         print("Trig count: {0}".format(self.scope.adc.trig_count))
         return trace
@@ -148,7 +176,7 @@ class Tools:
         if path is None:
             path = self._default_raw_path()
         if warmup_key is None:
-            warmup_key = np.ones(N, dtype=np.uint8)
+            warmup_key = np.random.randint(0,2,N)
         warmup_key = np.asarray(warmup_key, dtype=np.uint8)
 
         self.reset_target()
@@ -181,6 +209,17 @@ class Tools:
 
         if plot:
             self.plot_raw_traces(data=out, save_png=os.path.splitext(path)[0] + ".png")
+            tele_png = os.path.join(
+                os.path.dirname(path),
+                "warmup_telescope_rowlen{0}.png".format(self.rowlen))
+            self.plot_warmup_telescope(warmup=warmup, N=N, save_png=tele_png)
+            # results/ is git-ignored; keep a committed copy for the README.
+            docs_png = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "docs", "warmup_telescope.png")
+            os.makedirs(os.path.dirname(docs_png), exist_ok=True)
+            shutil.copyfile(tele_png, docs_png)
+            print("Copied telescope figure -> {0}".format(docs_png))
         return path
 
     @staticmethod
@@ -348,6 +387,132 @@ class Tools:
             fig.savefig(save_png, dpi=120)
             print("Saved plot -> {0}".format(save_png))
         plt.show()
+        return fig
+
+    def _butterfly_landmarks(self, trace, sad_thresh=2):
+        """Sample indices where the (allign_p0:allign_p1) reference window
+        lifted from the first butterfly re-matches -- one per stage-1
+        butterfly, the exact positions sliding_window_segmenter() keys its
+        segments off. Same SAD < sad_thresh test, but vectorised: SAD_inner
+        is a Python loop, fine for 63 segments, far too slow to sweep a
+        whole raw trace just for a plot.
+        """
+        trace = np.asarray(trace, dtype=np.float64)
+        w = allign_p1 - allign_p0
+        ref = trace[allign_p0:allign_p1]
+        n = len(trace) - w + 1
+        if n <= 0:
+            return np.empty(0, dtype=int)
+        sad = np.zeros(n)
+        for j in range(w):
+            sad += np.abs(trace[j:j + n] - ref[j])
+        return np.flatnonzero(sad < sad_thresh)
+
+    def plot_warmup_telescope(self, warmup=None, N=None, path=None, data=None,
+                              save_png=None, start_bf=0, n_bf_zoom=16,
+                              bf_index=None, show=True):
+        """Three-level telescopic view of one warmup capture, each panel a
+        sub-interval of the one above (the expanded slice shaded on the
+        parent):
+
+          1. the whole trigger window -- all N/2 stage-1 key-FFT butterflies
+             back-to-back under one trigger
+          2. `n_bf_zoom` consecutive butterfly segments, with the landmarks
+             sliding_window_segmenter() finds marked
+          3. one butterfly unit -- the same [-window_below, +window_above]
+             window the segmenter emits and a template scores -- with the
+             alignment window (allign_p0:allign_p1, the 70-sample reference
+             the segmenter slides across the trace) shaded
+
+        Called once by save_raw_traces(); also usable standalone by passing
+        `warmup`+`N`, or a raw-trace .npz `path` / `data` dict.
+        """
+        if warmup is None:
+            if data is None:
+                data = self.load_raw_traces(path or self._default_raw_path())
+            warmup = data["warmup"]
+            if N is None:
+                N = int(data["N"])
+        warmup = np.asarray(warmup, dtype=np.float64)
+
+        # match sliding_window_segmenter()'s constants
+        window_below, window_above = 300, 100
+        align_w = allign_p1 - allign_p0
+
+        lm = self._butterfly_landmarks(warmup)
+        expected = (N // 2 - 1) if N else None
+        if expected is not None and len(lm) != expected:
+            print("plot_warmup_telescope: {0} butterfly landmarks found, "
+                  "expected {1} -- warmup may be clipped or misaligned"
+                  .format(len(lm), expected))
+        if len(lm) < 2:
+            print("plot_warmup_telescope: too few landmarks to telescope; "
+                  "plotting the full window only")
+
+        # panel 2 span: n_bf_zoom butterflies starting at start_bf
+        start_bf = int(np.clip(start_bf, 0, max(0, len(lm) - 2)))
+        end_bf = min(len(lm) - 1, start_bf + n_bf_zoom) if len(lm) >= 2 else 0
+        p2_lo = max(0, int(lm[start_bf]) - window_below) if len(lm) else 0
+        p2_hi = (min(len(warmup), int(lm[end_bf]) + window_above)
+                 if len(lm) >= 2 else len(warmup))
+
+        # panel 3: one butterfly inside that span
+        if bf_index is None:
+            bf_index = min(len(lm) - 1, start_bf + n_bf_zoom // 2) if len(lm) else 0
+        bf = int(lm[bf_index]) if len(lm) else len(warmup) // 2
+        p3_lo = max(0, bf - window_below)
+        p3_hi = min(len(warmup), bf + window_above)
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+
+        ax = axes[0]
+        ax.plot(warmup, lw=0.6)
+        ax.axvspan(p2_lo, p2_hi, color="tab:orange", alpha=0.25,
+                   label="panel 2 ({0} butterflies)".format(max(0, end_bf - start_bf)))
+        ax.set_xlim(0, len(warmup))
+        ax.set_title("Warmup capture -- full stage-1 window "
+                     "({0} butterfly landmarks)".format(len(lm)))
+        ax.legend(fontsize=8, loc="upper right")
+
+        ax = axes[1]
+        x2 = np.arange(p2_lo, p2_hi)
+        ax.plot(x2, warmup[p2_lo:p2_hi], lw=0.8)
+        for i in range(start_bf, end_bf + 1):
+            ax.axvline(int(lm[i]), color="0.6", lw=0.7, ls=":")
+        ax.axvspan(p3_lo, p3_hi, color="tab:green", alpha=0.25,
+                   label="panel 3 (butterfly #{0})".format(bf_index))
+        ax.set_xlim(p2_lo, p2_hi)
+        ax.set_title("Telescope 1 -- {0} consecutive butterfly segments "
+                     "(dotted = landmarks)".format(max(0, end_bf - start_bf)))
+        ax.legend(fontsize=8, loc="upper right")
+
+        ax = axes[2]
+        x3 = np.arange(p3_lo, p3_hi)
+        ax.plot(x3, warmup[p3_lo:p3_hi], lw=1.0)
+        ax.axvspan(bf, bf + align_w, color="tab:red", alpha=0.30,
+                   label="alignment window [allign_p0:allign_p1]")
+        ax.axvline(bf, color="tab:red", lw=1.0)
+        ax.set_xlim(p3_lo, p3_hi)
+        ax.set_title("Telescope 2 -- one butterfly unit "
+                     "(segment = landmark [-{0}, +{1}])"
+                     .format(window_below, window_above))
+        ax.legend(fontsize=8, loc="upper right")
+
+        for ax in axes:
+            ax.set_xlabel("sample")
+            ax.set_ylabel("power")
+        fig.tight_layout()
+
+        if save_png is None:
+            results_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
+            save_png = os.path.join(
+                results_dir, "warmup_telescope_rowlen{0}.png".format(self.rowlen))
+        os.makedirs(os.path.dirname(save_png), exist_ok=True)
+        fig.savefig(save_png, dpi=120)
+        print("Saved plot -> {0}".format(save_png))
+        if show:
+            plt.show()
         return fig
 
     def plot_templates(self, path=None, data=None, save_png=None, segment=0):
