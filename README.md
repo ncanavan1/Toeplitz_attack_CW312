@@ -10,6 +10,12 @@ power signature depends only on its two input bits (4 possibilities:
 `00 01 10 11`), so one template per class is enough to read the key back
 two bits at a time.
 
+> **📄 Paper.** This is the code behind
+> [*Decimated in Linear Time; Single Power Trace, Full Key Recovery Attack on
+> Toeplitz Hash Privacy Amplification*](https://ieeexplore.ieee.org/document/11389417),
+> Canavan, Hoang, Khalid & O'Neill, **2025 Security for Space Systems (3S)**.
+> See [Citation](#citation).
+
 ---
 
 ## Repository layout
@@ -127,7 +133,6 @@ above it:
   single ~128 k-sample trace.
 - **Middle — 16 consecutive butterfly segments.** The periodicity resolves
   into one repeating unit per butterfly. Dotted lines are the landmarks
-  `
 - **Bottom — one butterfly unit.** This 400-sample window (`window_below=300`
   before the landmark, `window_above=100` after) is exactly one segment the
   segmenter emits, one row of a template, and one window
@@ -184,3 +189,28 @@ ok = ta.attack(rowlen=16, tests=10)       # -> bool
   is 64 bytes; see the header docstring of `toeplitz_fft_controller.py`
   for the tested limits (128 bytes comfortable, 256 tight, 512+ fails to
   link).
+
+---
+
+## Citation
+
+The attack methodology and the results produced with this code are
+published in:
+
+> N. Canavan, T. Hoang, A. Khalid and M. O'Neill,
+> **"Decimated in Linear Time; Single Power Trace, Full Key Recovery Attack
+> on Toeplitz Hash Privacy Amplification,"**
+> _2025 Security for Space Systems (3S)_, 2025, pp. 1–7.
+> IEEE Xplore: <https://ieeexplore.ieee.org/document/11389417>
+
+Please cite this paper if you use the code or build on the results.
+
+```bibtex
+@inproceedings{canavan2025decimated,
+  author    = {Canavan, Niall and Hoang, Tuan and Khalid, Ayesha and O'Neill, M\'aire},
+  title     = {Decimated in Linear Time; Single Power Trace, Full Key Recovery
+               Attack on Toeplitz Hash Privacy Amplification},
+  booktitle = {2025 Security for Space Systems (3S)},
+  year      = {2025}
+}
+```
